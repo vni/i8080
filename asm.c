@@ -1,9 +1,11 @@
 /*******************************************************************************
  *
- * FIXME: ADD SUPPORT FOR EQU, SET AND ORG PSEUDO OPCODES
+ * FIXME: ADD SUPPORT FOR EQU AND SET PSEUDO OPCODES
  * FIXME: LABELS:
- * FIXME:         Should they be case insensitive?
- * FIXME:         Should they be 1 to 5 characters long?
+ * FIXME:         Should they be case sensitive or case insensitive?
+ * FIXME:         Should they only be 1 to 5 characters long?
+ *
+ * gcc asm.c -ansi -pedantic -Wall 
  *
  ******************************************************************************/
 
@@ -31,50 +33,91 @@ struct opcode {
 int pass = 0; /* how much passes do we already have done */
 int need_second_pass = 0; /* Do we need second pass? If no forward label use - don't need. */
 
-int ch = ' ';
 int linenr = 1;
 
 struct label *labels = NULL;
 struct opcode opcodes[]; /* forward decl */
 
 unsigned char object[65536];
-int PC = 0; /* Current pos in program object. Labels refer here. */
+int PC = 0; /* Current pos in program object. */
+int org = 0; /* Labels refer here. */
 FILE *input_stream;
+
+int generate_binary_output = 0;
 
 /******************************************************************************/
 void gen_code(unsigned char code) {
 	object[PC++] = code;
+	org++;
 }
-
-/******************************************************************************/
-#define DBG(msg, ...) \
-	printf("%s():%d: " msg, __FUNCTION__, __LINE__, ##__VA_ARGS__)
 
 /******************************************************************************/
 void die(const char *fmt, ...) {
 	va_list args;
 	va_start(args, fmt);
+	fprintf(stderr, "ERROR at line %d of input, pass = %d:\n\t", linenr, pass);
 	vfprintf(stderr, fmt, args);
 	va_end(args);
 	exit(13);
 }
 
-/* PRIMITIVES FOR READING INPUT STREAM ****************************************/
-void nextchar() {
-	if (ch != EOF)
-		ch = fgetc(input_stream);
+/* strdup is not in the ANSI C standart */
+char *xstrdup(const char *str) {
+	int len = strlen(str) + 1;
+	char *copy = malloc(len);
+	if (copy == NULL)
+		die("failed to allocate memory in xstrdup\n");
+	memcpy(copy, str, len);
+	return copy;
 }
 
+/* PRIMITIVES FOR READING INPUT STREAM ****************************************/
+static char line[256];
+static int pos = 0;
+
+/* peek current character */
+int ch() {
+	if (feof(input_stream))
+		return EOF;
+	return line[pos];
+}
+void nextchar() {
+	char *r;
+
+	if (feof(input_stream))
+		return;
+
+	if (line[pos] == '\0' || line[pos] == '\n') {
+		/* read new line from the input stream */
+		r = fgets(line, sizeof(line), input_stream);
+		if (r == NULL)
+			return;
+		pos = 0;
+	} else {
+		pos++;
+	}
+}
+
+/* rewind input stream for 'cnt' characters backwards */
+void unget(int cnt) {
+	pos -= cnt;
+	if (pos < 0)
+		die("ERROR: failed to unget for cnt=%d chars backwards, pos=%d is negative now\n", cnt, pos);
+}
+
+/******************************************************************************/
+
 void skip_white() {
-	while (ch == ' ' || ch == '\t')
+	while (ch() == ' ' || ch() == '\t')
 		nextchar();
 }
 
 void skip_comment() {
-	if (ch != ';')
+	skip_white();
+	if (ch() != ';')
 		return;
 
-	while (ch != EOF && ch != '\n')
+	while (ch() != EOF && ch() != '\n')
 		nextchar();
 }
 
@@ -85,8 +128,8 @@ int _reg(const char **reg_names) {
 	int i;
 
 	skip_white();
-	for (i=0; i<sizeof(buf)-1 && isalpha(ch); i++) {
-		buf[i] = toupper(ch);
+	for (i=0; i<sizeof(buf)-1 && isalpha(ch()); i++) {
+		buf[i] = toupper(ch());
 		nextchar();
 	}
 	buf[i] = '\0';
@@ -94,7 +137,7 @@ int _reg(const char **reg_names) {
 	for (i=0; reg_names[i]; i++)
 		if (!strcmp(buf, reg_names[i]))
 			return i;
-	die("ERROR on line %d: invalid register name '%s'.\n", linenr, buf);
+	die("Invalid register name '%s'.\n", buf);
 	return -1; /* UNREACHABLE */
 }
 
@@ -118,13 +161,14 @@ int label_value() {
 	char buf[6];
 	int i;
 	struct label *l = labels;
-	buf[0] = toupper(ch); /* in case of first char is '@' or '?' */
+	buf[0] = ch(); /* in case of first char is '@' or '?' */
 	nextchar();
-	for (i=1; i<sizeof(buf)-1 && isalpha(ch); i++, nextchar())
-		buf[i] = toupper(ch);
+	for (i=1; i<sizeof(buf)-1 && isalpha(ch()); i++, nextchar())
+		buf[i] = ch();
 	buf[i] = '\0';
 
 	while (l) {
+		/*printf("label_value() %s\n", l->name);*/
 		if (!strcmp(l->name, buf))
 			return l->addr;
 		l = l->next;
@@ -132,7 +176,7 @@ int label_value() {
 
 	if (pass) { /* labels can be missed only on the first (zero) pass */
 		/* SHOULDN'T BE HERE */
-		die("ERROR at line %d: label '%s' not found\n", linenr, buf);
+		die("Label '%s' is not found\n", buf);
 	}
 	need_second_pass = 1;
 	return 0x00;
@@ -151,23 +195,23 @@ int integer() {
 	int i;
 	int res = 0;
 
-	if (!isdigit(ch))
-		die("ERROR at line %d: xdigit expected\n", linenr);
-	for (i=0; i<sizeof(buf)-1 && isxdigit(ch); i++, nextchar())
-		buf[i] = ch;
+	if (!isdigit(ch()))
+		die("xdigit expected\n");
+	for (i=0; i<sizeof(buf)-1 && isxdigit(ch()); i++, nextchar())
+		buf[i] = ch();
 	buf[i] = '\0';
 
-	if (toupper(ch) == 'H') { /* hexademical number */
+	if (toupper(ch()) == 'H') { /* hexademical number */
 		for (i=0; buf[i]; i++)
 			res = (res<<4) + xdigit(buf[i]);
 		nextchar();
 	} else { /* decimal number */
 		for (i=0; buf[i]; i++) {
 			if (!isdigit(buf[i]))
-				die("ERROR at line %d: invalid character '%c' in decimal constant\n", linenr, ch);
+				die("invalid character '%c' in decimal constant\n", ch());
 			res = res*10 + (buf[i]-'0');
 		}
-		if (toupper(ch) == 'D')
+		if (toupper(ch()) == 'D')
 			nextchar();
 	}
 
@@ -176,14 +220,14 @@ int integer() {
 
 int constant() {
 	skip_white();
-	if (ch == '?' || ch == '@' || isalpha(ch)) {
+	if (ch() == '?' || ch() == '@' || isalpha(ch())) {
 		return label_value();
 	} else {
 		int sign = 1;
-		switch(ch) {
+		switch(ch()) {
 			case '$': /* special character means 'current line number' */
 				nextchar();
-				return PC;
+				return org;
 			case '-':
 				sign = -1;
 				/* and fallthrough */
@@ -197,7 +241,7 @@ int constant() {
 int mpow(int x, int p) {
 	int n = 1;
 	if (p < 1)
-		die("%s(): doesn't support negative exponent\n", __func__);
+		die("doesn't support negative exponent\n");
 	while (p--)
 		n *= x;
 	return n;
@@ -206,7 +250,7 @@ int mpow(int x, int p) {
 int power() {
 	int op1 = constant();
 	skip_white();
-	if (ch == '^') {
+	if (ch() == '^') {
 		nextchar();
 		return mpow(op1, power());
 	} else {
@@ -219,7 +263,7 @@ int factor() {
 	op1 = power();
 	while (1) {
 		skip_white();
-		switch (ch) {
+		switch (ch()) {
 			case '*':
 				nextchar();
 				op2 = power();
@@ -229,7 +273,7 @@ int factor() {
 				nextchar();
 				op2 = power();
 				if (op2 == 0)
-					die("%s: division by 0\n", __func__);
+					die("division by 0\n");
 				op1 /= op2;
 				break;
 			case '%':
@@ -248,7 +292,7 @@ int term() {
 	op1 = factor();
 	while (1) {
 		skip_white();
-		switch (ch) {
+		switch (ch()) {
 			case '+':
 				nextchar();
 				op2 = factor();
@@ -273,22 +317,22 @@ int expr() {
 int imm3() {
 	int res = expr();
 	if (res > 7)
-		die("ERROR at line %d: invalid value %d for imm3 operand. "
-				"It should fit into 3 bits in RST instruction\n", linenr, res);
+		die("invalid value %d for imm3 operand. "
+				"It should fit into 3 bits in RST instruction\n", res);
 	return res;
 }
 
 int imm8() {
 	int res = expr();
 	if (res > 255)
-		die("ERROR at line %d: invalid value %d for imm8 operand. It should fit into byte\n", linenr, res);
+		die("invalid value %d for imm8 operand. It should fit into byte\n", res);
 	return res;
 }
 
 int imm16() {
 	int res = expr();
 	if (res > 65536)
-		die("ERROR at line %d: invalid value %d for imm16 operand. It should fit into word\n", linenr, res);
+		die("invalid value %d for imm16 operand. It should fit into word\n", res);
 	return res;
 }
 
@@ -296,34 +340,30 @@ int imm16() {
 void db_cb(unsigned char unused) {
 	while (1) {
 		skip_white();
-		if (ch == '\'') {
+		if (ch() == '\'') {
 			while (1) {
 				nextchar();
-				if (ch == '\'') { /* check for double ' */
+				if (ch() == '\'') { /* check for double ' */
 					nextchar();
-					if (ch == '\'')
+					if (ch() == '\'')
 						gen_code('\'');
-						/*printf("%02X ", '\'');*/
 					else
 						break;
 				} else {
-					gen_code(ch);
-					/*printf("%02X ", ch);*/
+					gen_code(ch());
 				}
 			}
 		} else {
 			int r = imm8();
 			gen_code(r);
-			/*printf("%02X ", r);*/
 		}
 
 		skip_white();
-		if (ch == ',')
+		if (ch() == ',')
 			nextchar();
 		else
 			break;
 	}
-	/*printf("\n");*/
 }
 
 void dw_cb(unsigned char unused) {
@@ -331,9 +371,8 @@ void dw_cb(unsigned char unused) {
 		int r = imm16();
 		gen_code(r&0xFF);
 		gen_code(r>>8);
-		/*printf("%02X %02X\n", r&0xFF, r>>8);*/
 		skip_white();
-		if (ch == ',')
+		if (ch() == ',')
 			nextchar();
 		else
 			break;
@@ -344,19 +383,16 @@ void ds_cb(unsigned char unused) {
 	int r = imm16();
 	while (r--)
 		gen_code(0x00); /* just a placeholder */
-		/*printf("00\n");*/
 }
 
 void generic_cb(unsigned char arg) {
 	gen_code(arg);
-	/*printf("%02X\n", arg);*/
 }
 
 void inr_dcr_cb(unsigned char arg) {
 	int r = reg();
 	r <<= 3;
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
@@ -365,31 +401,28 @@ void mov_cb(unsigned char arg) {
 	r <<= 3;
 	arg |= r;
 	skip_white();
-	if (ch != ',')
-		die("ERROR at line %d: MOV instruction expects ',' after the first operand, but got '%c'\n", linenr, ch);
+	if (ch() != ',')
+		die("MOV instruction expects ',' after the first operand, but got '%c'\n", ch());
 	nextchar();
 	r = reg();
 	arg |= r;
 	if (arg == 0x76)
-		die("ERROR at line %d: illegal instruction: MOV M,M\n", linenr);
+		die("illegal instruction: MOV M,M\n");
 	gen_code(arg);
-	/*printf("%02X\n", arg);*/
 }
 
 void stax_ldax_cb(unsigned char arg) {
 	int r = reg();
 	if (r != 0 && r != 2) /* not B nor D register pair */
-		die("ERROR at line %d: STAX expects B or D register pair, but got %d\n", linenr, r);
+		die("STAX expects B or D register pair, but got %d\n", r);
 	r = r ? (1<<4) : 0;
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
 void rma_cb(unsigned char arg) {
 	int r = reg();
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
@@ -397,7 +430,6 @@ void push_pop_cb(unsigned char arg) {
 	int r = rp_psw();
 	r <<= 4;
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
@@ -405,7 +437,6 @@ void rpi_cb(unsigned char arg) {
 	int r = rp_sp();
 	r <<= 4;
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
@@ -414,11 +445,10 @@ void lxi_cb(unsigned char arg) {
 	r <<= 4;
 	arg |= r;
 	skip_white();
-	if (ch != ',')
-		die("ERROR at line %d: expected operand delimiter ',', but got '%c'\n", linenr, ch);
+	if (ch() != ',')
+		die("expected operand delimiter ',', but got '%c'\n", ch());
 	nextchar();
 	r = imm16();
-	/*printf("%02X %02X %02X\n", arg, r&0xFF, r>>8);*/
 	gen_code(arg);
 	gen_code(r&0xFF);
 	gen_code(r>>8);
@@ -429,25 +459,22 @@ void mvi_cb(unsigned char arg) {
 	r <<= 3;
 	arg |= r;
 	skip_white();
-	if (ch != ',')
-		die("ERROR at line %d: expected operand delimiter ',', but got '%c'\n", linenr, ch);
+	if (ch() != ',')
+		die("expected operand delimiter ',', but got '%c'\n", ch());
 	nextchar();
 	r = imm8();
-	/*printf("%02X %02X\n", arg, r);*/
 	gen_code(arg);
 	gen_code(r);
 }
 
 void imm_ins_cb(unsigned char arg) {
 	int r = imm8();
-	/*printf("%02X %02X\n", arg, r);*/
 	gen_code(arg);
 	gen_code(r);
 }
 
 void dir_addr_ins_cb(unsigned char arg) {
 	int r = imm16();
-	/*printf("%02X %02X %02X\n", arg, r&0xFF, r>>8);*/
 	gen_code(arg);
 	gen_code(r);
 	gen_code(r>>8);
@@ -455,7 +482,6 @@ void dir_addr_ins_cb(unsigned char arg) {
 
 void jmp_call_cb(unsigned char arg) {
 	int r = imm16();
-	/*printf("%02X %02X %02X\n", arg, r&0xFF, r>>8);*/
 	gen_code(arg);
 	gen_code(r);
 	gen_code(r>>8);
@@ -465,15 +491,17 @@ void rst_cb(unsigned char arg) {
 	int r = imm3();
 	r <<= 3;
 	arg |= r;
-	/*printf("%02X\n", arg);*/
 	gen_code(arg);
 }
 
 void in_out_cb(unsigned char arg) {
 	int r = imm8();
-	/*printf("%02X %02X\n", arg, r);*/
 	gen_code(arg);
 	gen_code(r);
+}
+
+void org_cb(unsigned char unused) {
+	org = imm16();
 }
 
 /* OPCODE TABLE ***************************************************************/
@@ -576,6 +604,8 @@ struct opcode opcodes[] = {
 	{ "OUT", in_out_cb, 0xD3 },
 	/* HLT HALT INSTRUCTION */
 	{ "HLT", generic_cb, 0x76 },
+	/* PSEUDO INSTRUCTIONS */
+	{ "ORG", org_cb, 0x00 },
 	/* TERMINATOR */
 	{ NULL, NULL, 0x00 },
 };
@@ -600,19 +630,22 @@ int label_already_defined(const char *lbl) {
 }
 
 void create_label(const char *lbl) {
+	struct label *l = NULL;
 	if (pass) /* create labels only on first (zero) pass */
 		return;
 	if (label_already_defined(lbl))
-		die("ERROR at line %d: label '%s' is already defined\n", linenr, lbl);
+		die("label '%s' is already defined\n", lbl);
 	if (!label_has_valid_name(lbl))
-		die("ERROR at line %d: label '%s' has invalid name\n", linenr, lbl);
-	struct label *l = malloc(sizeof(struct label));
+		die("label '%s' has invalid name\n", lbl);
+	l = malloc(sizeof(struct label));
 	if (l == NULL)
-		die("ERROR: failed to allocate memory for label node\n");
-	l->name = strdup(lbl);
-	if (l->name == NULL)
-		die("ERROR: failed to allocate memory for label node name\n");
-	l->addr = PC;
+		die("failed to allocate memory for label node\n");
+	l->name = xstrdup(lbl); 
+	if (l->name == NULL) {
+		free(l);
+		die("failed to allocate memory for label node name\n");
+	}
+	l->addr = org;
 	l->next = labels;
 	labels = l;
 }
@@ -629,57 +662,47 @@ void erase_labels(void) {
 }
 
 /******************************************************************************/
-void opcode() {
+void label() {
 	char buf[6];
-	int i, label_created = 0;
+	int i = 0;
 
 	skip_white();
-
-	if (ch == '@' || ch == '?') {
-		buf[0] = ch;
-		nextchar();
-		for (i=1; i<sizeof(buf)-1 && isalpha(ch); i++) {
-			buf[i] = ch;
+	if (ch() == '@' || ch() == '?' || isalpha(ch())) {
+		do {
+			buf[i++] = ch();
 			nextchar();
-		} buf[i] = '\0';
-		if (ch != ':')
-			die("ERROR at line %d: ':' after label '%s' is expected\n", linenr, buf);
-		nextchar(); /* skip ':' */
-		create_label(buf);
-		label_created = 1;
-		skip_white();
-	} else {
-		/* maybe opcode or label */
-		for (i=0; i<sizeof(buf)-1 && isalpha(ch); i++) {
-			buf[i] = toupper(ch);
-			nextchar();
-		} buf[i] = '\0';
-
-		if (ch == ':') { /* a label */
+		} while ((i <sizeof(buf)-1) && isalpha(ch()));
+		buf[i] = '\0';
+		if (i == sizeof(buf)-1 && ch() != ':')
+			die("OPCODE is too long\n"); 
+		if (ch() == ':') {
 			create_label(buf);
 			nextchar(); /* skip ':' */
-			label_created = 1;
-			skip_white();
+		} else { /* put back what we have read */
+			unget(i);
 		}
 	}
+}
 
-	switch (ch) {
-		case EOF: return;
-		case '\n': return;
-		case ';': return;
-	}
+void opcode() {
+	char buf[6];
+	int i;
 
-	if (label_created) { /* read opcode only if previously we have read label */
-		for (i=0; i<sizeof(buf)-1 && isalpha(ch); i++) {
-			buf[i] = toupper(ch);
-			nextchar();
-		} buf[i] = '\0';
+	skip_white();
+	if (!isalpha(ch())) {
+		return;
 	}
+	for (i=0; i<sizeof(buf)-1 && isalpha(ch()); i++) {
+		buf[i] = toupper(ch());
+		nextchar();
+	}
+	buf[i] = '\0';
 
 	if (i == sizeof(buf)-1)
-		die("ERROR at line %d: OPCODE is too long\n", linenr); 
-	if (!isspace(ch) && ch != EOF)
-		die("ERROR at line %d: OPCODE should be trailed by an empty space\n", linenr);
+		die("OPCODE is too long\n"); 
+	if (!isspace(ch()) && ch() != EOF && ch() != ';') {
+		die("OPCODE should be trailed by an empty space\n");
+	}
 
 	for (i=0; opcodes[i].mnemo; i++)
 		if (strcmp(buf, opcodes[i].mnemo) == 0)
@@ -687,74 +710,75 @@ void opcode() {
 	if (opcodes[i].mnemo)
 		opcodes[i].cb(opcodes[i].arg);
 	else
-		die("ERROR at line %d: UNEXPECTED OPCODE: %s\n", linenr, buf);
+		die("UNEXPECTED OPCODE: '%s'\n", buf);
 }
 
 void statement() {
+	label();
 	opcode();
-
-	skip_white();
 	skip_comment();
 
-	if (ch != '\n')
-		die("ERROR at line %d: Expected '\\n' at the end of a statement\n", linenr);
+	if (ch() != '\n')
+		die("Expected '\\n' at the end of a statement, but got '%c' (0x%02X)\n", ch(), ch());
+	nextchar(); /* skip '\n' */
 	linenr++;
 }
 
 /******************************************************************************/
 void process_file(const char *filepath) {
 	/* set global vars to initial state */
+	line[pos=0] = '\0';
 	linenr = 1;
-	PC = 0;
+	org = PC = 0;
 	pass = 0;
 	need_second_pass = 0;
-	ch = ' ';
 	erase_labels();
 
 	input_stream = fopen(filepath, "r");
 	if (input_stream == NULL)
-		die("ERROR: failed to open file '%s': %s\n", filepath, strerror(errno));
+		die("failed to open file '%s': %s\n", filepath, strerror(errno));
 
-	while (ch != EOF) {
+	nextchar(); /* get first line */
+	while (ch() != EOF)
 		statement();
-		nextchar();
-	}
 
 	if (need_second_pass) {
 		rewind(input_stream);
+		line[pos=0] = '\0';
 		linenr = 1;
-		PC = 0;
+		org = PC = 0;
 		pass = 1;
-		ch = ' ';
 
-		while (ch != EOF) {
+		nextchar();
+		while (ch() != EOF)
 			statement();
-			nextchar();
-		}
 	}
 	fclose(input_stream);
 
 	{
-		int i;
-		for (i=0; i<PC; i++) {
-			printf(" %02X ", object[i]);
-			if ((i+1) % 16 == 0)
+		if (generate_binary_output) {
+			int i;
+			for (i=0; i<PC; i++)
+				printf("%c", object[i]);
+		} else {
+			int i;
+			for (i=0; i<PC; i++) {
+				printf(" %02X ", object[i]);
+				if ((i+1) % 16 == 0)
+					printf("\n");
+			}
+			if (i%16)
 				printf("\n");
-		}
-		if (i%16)
-			printf("\n");
-		return;
-		struct label *l = labels;
-		printf("\nLABELS:\n");
-		while (l) {
-			printf("%s: %04X\n", l->name, l->addr);
-			l = l->next;
 		}
 	}
 }
 
 int main(int argc, char *argv[]) {
-	while (*++argv)
-		process_file(*argv);
+	while (*++argv) {
+		if (!strcmp(*argv, "--binary") || !strcmp(*argv, "-b"))
+			generate_binary_output = 1;
+		else
+			process_file(*argv);
+	}
 	return 0;
 }
