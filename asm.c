@@ -43,8 +43,6 @@ int PC = 0; /* Current pos in program object. */
 int org = 0; /* Labels refer here. */
 FILE *input_stream;
 
-int generate_binary_output = 0;
-
 /******************************************************************************/
 void gen_code(unsigned char code) {
 	object[PC++] = code;
@@ -726,6 +724,10 @@ void statement() {
 
 /******************************************************************************/
 void process_file(const char *filepath) {
+	int i;
+	FILE *output_stream = NULL;
+	char objfilename[32];
+	char *dot;
 	/* set global vars to initial state */
 	line[pos=0] = '\0';
 	linenr = 1;
@@ -755,30 +757,32 @@ void process_file(const char *filepath) {
 	}
 	fclose(input_stream);
 
-	{
-		if (generate_binary_output) {
-			int i;
-			for (i=0; i<PC; i++)
-				printf("%c", object[i]);
-		} else {
-			int i;
-			for (i=0; i<PC; i++) {
-				printf(" %02X ", object[i]);
-				if ((i+1) % 16 == 0)
-					printf("\n");
-			}
-			if (i%16)
-				printf("\n");
-		}
+	/* write out binary image */
+	dot = strrchr(filepath, '.');
+	if (dot) {
+		int objfilenamelen = dot - filepath + 1 + 3 + 1; /* +1 for '.', +3 for 'obj', +1 for '\0' */
+		if (objfilenamelen > sizeof(objfilename))
+			die("OOPS, output filename is too long: %d, should be most %d bytes long.\n",
+					objfilenamelen, sizeof(objfilename)-1);
+		sprintf(objfilename, "%.*s.obj", dot-filepath, filepath);
+	} else {
+		int objfilenamelen = strlen(filepath) + 1 + 3 + 1; /* +1 for '.', +3 for 'obj', +1 for '\0' */
+		if (objfilenamelen > sizeof(objfilename))
+			die("OOPS, output filename is too long: %d, should be most %d bytes long.\n",
+					objfilenamelen, sizeof(objfilename)-1);
+		sprintf(objfilename, "%s.obj", filepath);
 	}
+	output_stream = fopen(objfilename, "w");
+	if (output_stream == NULL)
+		die("Failed to open %s for writing: %s\n", objfilename, strerror(errno));
+	/* FIXME: use fwrite instead of fprintf */
+	for (i=0; i<PC; i++)
+		fprintf(output_stream, "%c", object[i]);
+	fclose(output_stream);
 }
 
 int main(int argc, char *argv[]) {
-	while (*++argv) {
-		if (!strcmp(*argv, "--binary") || !strcmp(*argv, "-b"))
-			generate_binary_output = 1;
-		else
-			process_file(*argv);
-	}
+	while (*++argv)
+		process_file(*argv);
 	return 0;
 }
