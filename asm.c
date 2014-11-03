@@ -1,9 +1,15 @@
 /*******************************************************************************
  *
- * FIXME: ADD SUPPORT FOR EQU AND SET PSEUDO OPCODES
  * FIXME: LABELS:
  * FIXME:         Should they be case sensitive or case insensitive?
  * FIXME:         Should they only be 1 to 5 characters long?
+ * FIXME:	Can they be redefined? For now it is discarded.
+ * FIXME: Make code more beautiful:
+ *			* make static functions and global variables as many as possible
+ *			* make the code more local
+ *			* make the code more structured and 'packed'
+ * FIXME: Show in the code that there are not only labels but also names which
+ *			are treated similalry to labels.
  *
  * gcc asm.c -ansi -pedantic -Wall 
  *
@@ -20,6 +26,9 @@
 struct label {
 	char *name;
 	unsigned short addr;
+	unsigned flags;
+#define EQU_NAME 1
+#define SET_NAME 2
 	struct label *next;
 };
 
@@ -37,6 +46,8 @@ int linenr = 1;
 
 struct label *labels = NULL;
 struct opcode opcodes[]; /* forward decl */
+
+char last_name[6]; /* used by EQU and SET pseudo opcodes */
 
 unsigned char object[65536];
 int PC = 0; /* Current pos in program object. */
@@ -77,7 +88,7 @@ static int pos = 0;
 int ch() {
 	if (feof(input_stream))
 		return EOF;
-	return line[pos];
+	return toupper(line[pos]);
 }
 void nextchar() {
 	char *r;
@@ -127,7 +138,7 @@ int _reg(const char **reg_names) {
 
 	skip_white();
 	for (i=0; i<sizeof(buf)-1 && isalpha(ch()); i++) {
-		buf[i] = toupper(ch());
+		buf[i] = ch();
 		nextchar();
 	}
 	buf[i] = '\0';
@@ -184,7 +195,7 @@ int xdigit(int ch) {
 	/* ch assumed to be a valid xdigit */
 	if (ch >= '0' && ch <= '9')
 		return ch-'0';
-	ch = toupper(ch);
+	/*ch = toupper(ch);*/
 	return ch-'A'+10;
 }
 
@@ -199,7 +210,7 @@ int integer() {
 		buf[i] = ch();
 	buf[i] = '\0';
 
-	if (toupper(ch()) == 'H') { /* hexademical number */
+	if (ch() == 'H') { /* hexademical number */
 		for (i=0; buf[i]; i++)
 			res = (res<<4) + xdigit(buf[i]);
 		nextchar();
@@ -209,7 +220,7 @@ int integer() {
 				die("invalid character '%c' in decimal constant\n", ch());
 			res = res*10 + (buf[i]-'0');
 		}
-		if (toupper(ch()) == 'D')
+		if (ch() == 'D')
 			nextchar();
 	}
 
@@ -608,7 +619,65 @@ struct opcode opcodes[] = {
 	{ NULL, NULL, 0x00 },
 };
 
+/* PSEUDO OPCODE CALLBACKS ****************************************************/
+struct label *label_already_defined(const char *lbl); /* forward declaration */
+/* SET can set value to name multiple times */
+void set_cb(unsigned char unused_arg) {
+	struct label *l;
+	(void)unused_arg;
+	if (last_name[0] == '\0')
+		die("%s: FAILED to find label for SET.\n", __FUNCTION__);
+	l = label_already_defined(last_name);
+	if (l) {
+		if (l->flags & SET_NAME)
+			l->addr = imm16();
+		else if (l->flags & EQU_NAME)
+			die("FAILED to SET already EQU label name.\n");
+		else
+			die("FAILED to SET already used label name as ordinary label.\n");
+	} else {
+		l = malloc(sizeof(struct label));
+		if (l == NULL)
+			die("FAILED to allocate memory for new label in SET cb.\n");
+		l->name = xstrdup(last_name);
+		l->addr = imm16();
+		l->flags = SET_NAME;
+		l->next = labels;
+		labels = l;
+	}
+}
+
+/* EQU cat set value to name only once */
+void equ_cb(unsigned char unused_arg) {
+	struct label *l;
+	(void)unused_arg;
+	if (last_name[0] == '\0')
+		die("%s: FAILED to find label for SET.\n", __FUNCTION__);
+	l = label_already_defined(last_name);
+	if (l)
+		die("FAILED to redefine a label or name with EQU.\n");
+
+	l = malloc(sizeof(struct label));
+	if (l == NULL)
+		die("FAILED to allocate memory for new label in SET cb.\n");
+	l->name = xstrdup(last_name);
+	l->addr = imm16();
+	l->flags = EQU_NAME;
+	l->next = labels;
+	labels = l;
+}
+
+/* PSEUDO OPCODE TABLE ********************************************************/
+struct opcode pseudo_opcodes[] = {
+	{ "SET", set_cb, 0x00 },
+	{ "EQU", equ_cb, 0x00 },
+	{ NULL, NULL, 0x00 }
+};
+
 /* LABEL MANIPULATION FUNCTIONS ***********************************************/
+/* FIXME: Do 'SET:' or 'EQU:' valid labels or no?
+ * If YES, then next two function should exist together.
+ * If NO, then only one. */
 int label_has_valid_name(const char *lbl) {
 	int i;
 	for (i=0; opcodes[i].mnemo; i++)
@@ -617,14 +686,25 @@ int label_has_valid_name(const char *lbl) {
 	return 1;
 }
 
-int label_already_defined(const char *lbl) {
+int is_opcode_or_pseudo_opcode(const char *lbl) {
+	int i;
+	for (i=0; opcodes[i].mnemo; i++)
+		if (!strcmp(opcodes[i].mnemo, lbl))
+			return 1;
+	for (i=0; pseudo_opcodes[i].mnemo; i++)
+		if (!strcmp(pseudo_opcodes[i].mnemo, lbl))
+			return 1;
+	return 0;
+}
+
+struct label *label_already_defined(const char *lbl) {
 	struct label *l = labels;
 	while (l) {
 		if (!strcmp(l->name, lbl))
-			return 1;
+			return l;
 		l=l->next;
 	}
-	return 0;
+	return NULL;
 }
 
 void create_label(const char *lbl) {
@@ -643,6 +723,7 @@ void create_label(const char *lbl) {
 		free(l);
 		die("failed to allocate memory for label node name\n");
 	}
+	l->flags = 0;
 	l->addr = org;
 	l->next = labels;
 	labels = l;
@@ -673,11 +754,13 @@ void label() {
 		buf[i] = '\0';
 		if (i == sizeof(buf)-1 && ch() != ':')
 			die("OPCODE is too long\n"); 
-		if (ch() == ':') {
+		if (ch() == ':') { /* it is definitely a label */
 			create_label(buf);
 			nextchar(); /* skip ':' */
-		} else { /* put back what we have read */
-			unget(i);
+		} else if (is_opcode_or_pseudo_opcode(buf)) {
+			unget(i); /* put back what we have read */
+		} else {
+			strcpy(last_name, buf);
 		}
 	}
 }
@@ -691,7 +774,7 @@ void opcode() {
 		return;
 	}
 	for (i=0; i<sizeof(buf)-1 && isalpha(ch()); i++) {
-		buf[i] = toupper(ch());
+		buf[i] = ch();
 		nextchar();
 	}
 	buf[i] = '\0';
@@ -699,19 +782,31 @@ void opcode() {
 	if (i == sizeof(buf)-1)
 		die("OPCODE is too long\n"); 
 	if (!isspace(ch()) && ch() != EOF && ch() != ';') {
+		printf("*JK*> buf='%s'\n", buf);
+		printf("*JK*> ch()='%c' (0x%02X)\n", ch(), ch());
 		die("OPCODE should be trailed by an empty space\n");
 	}
 
 	for (i=0; opcodes[i].mnemo; i++)
 		if (strcmp(buf, opcodes[i].mnemo) == 0)
 			break;
-	if (opcodes[i].mnemo)
+	if (opcodes[i].mnemo) {
 		opcodes[i].cb(opcodes[i].arg);
-	else
-		die("UNEXPECTED OPCODE: '%s'\n", buf);
+		return;
+	}
+	for (i=0; pseudo_opcodes[i].mnemo; i++)
+		if (strcmp(buf, pseudo_opcodes[i].mnemo) == 0)
+			break;
+	if (pseudo_opcodes[i].mnemo) {
+		pseudo_opcodes[i].cb(pseudo_opcodes[i].arg);
+		return;
+	}
+	
+	die("UNEXPECTED OPCODE: '%s'\n", buf);
 }
 
 void statement() {
+	last_name[0] = '\0'; /* erase last_name */
 	label();
 	opcode();
 	skip_comment();
